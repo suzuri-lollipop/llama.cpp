@@ -2523,12 +2523,39 @@ private:
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, llama_state_staging * staging = nullptr) : ptr(p), buf_size(len), staging(staging) {}
 
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            ggml_backend_t backend = nullptr;
+
+            if (staging && staging->base) {
+                auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
+
+                const auto it = staging->backends.find(buft);
+                if (it != staging->backends.end()) {
+                    backend = it->second;
+                }
+            }
+
+            if (backend == nullptr) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+                continue;
+            }
+
+            // copy through the pinned staging buffer - much faster than a pageable host copy
+            size_t done = 0;
+            while (done < winfo.size) {
+                const size_t n = std::min(staging->size, winfo.size - done);
+
+                ggml_backend_tensor_get_async(backend, winfo.tensor, staging->base, winfo.offset + done, n);
+                ggml_backend_synchronize(backend);
+
+                memcpy(winfo.ptr + done, staging->base, n);
+
+                done += n;
+            }
         }
     }
 
@@ -2571,16 +2598,44 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    llama_state_staging * staging = nullptr;
 };
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len, llama_state_staging * staging = nullptr) : ptr(p), buf_size(len), staging(staging) {}
 
     ~llama_io_read_host() {
         // flush the reads
         for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            ggml_backend_t backend = nullptr;
+
+            if (staging && staging->base) {
+                auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+
+                const auto it = staging->backends.find(buft);
+                if (it != staging->backends.end()) {
+                    backend = it->second;
+                }
+            }
+
+            if (backend == nullptr) {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+                continue;
+            }
+
+            size_t done = 0;
+            while (done < rinfo.size) {
+                const size_t n = std::min(staging->size, rinfo.size - done);
+
+                memcpy(staging->base, rinfo.ptr + done, n);
+
+                ggml_backend_tensor_set_async(backend, rinfo.tensor, staging->base, rinfo.offset + done, n);
+                ggml_backend_synchronize(backend);
+
+                done += n;
+            }
         }
     }
 
@@ -2623,6 +2678,8 @@ private:
         size_t offset;
     };
     std::vector<read_info> rinfos;
+
+    llama_state_staging * staging = nullptr;
 };
 
 class llama_io_write_file : public llama_io_write_i {
@@ -2896,6 +2953,55 @@ private:
     const llama_memory_buffers & mbufs;
 };
 
+llama_state_staging * llama_context::state_staging_get() {
+    auto & st = state_staging;
+
+    if (st.init) {
+        return &st;
+    }
+
+    st.init = true;
+
+    const char * LLAMA_STATE_STAGING_DISABLE = getenv("LLAMA_STATE_STAGING_DISABLE");
+    if (LLAMA_STATE_STAGING_DISABLE && atoi(LLAMA_STATE_STAGING_DISABLE) != 0) {
+        LLAMA_LOG_WARN("%s: state staging disabled\n", __func__);
+        return &st;
+    }
+
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        st.backends[backend_buft[i]] = backend_ptrs[i];
+    }
+
+    // allocate a pinned host buffer for staged transfers, if the device supports it
+    for (auto * backend : backend_ptrs) {
+        auto * dev = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+
+        auto * buft = ggml_backend_dev_host_buffer_type(dev);
+        if (buft == nullptr) {
+            continue;
+        }
+
+        constexpr size_t size = 32u*1024u*1024u;
+
+        auto * buf = ggml_backend_buft_alloc_buffer(buft, size);
+        if (buf == nullptr) {
+            continue;
+        }
+
+        st.buf.reset(buf);
+        st.base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+        st.size = size;
+
+        LLAMA_LOG_INFO("%s: allocated %.2f MiB staging buffer ('%s')\n", __func__, size/1024.0/1024.0, ggml_backend_buft_name(buft));
+        break;
+    }
+
+    return &st;
+}
+
 size_t llama_context::state_get_size() {
     llama_io_write_dummy io(false);
     try {
@@ -2907,7 +3013,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, state_staging_get());
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -2917,7 +3023,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    llama_io_read_host io(src, size);
+    llama_io_read_host io(src, size, state_staging_get());
     try {
         return state_read_data(io);
     } catch (const std::exception & err) {
@@ -2946,7 +3052,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, state_staging_get());
     }
 
     try {
@@ -2979,7 +3085,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(src, size, state_staging_get());
     }
 
     try {
