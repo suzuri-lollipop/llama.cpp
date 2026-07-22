@@ -599,9 +599,17 @@ struct server_prompt {
     }
 
     server_prompt clone() const {
+        // on-device checkpoint data is tied to the source sequence storage, so drop it from clones
+        std::list<common_prompt_checkpoint> checkpoints_host;
+        for (const auto & ckpt : checkpoints) {
+            if (!ckpt.on_device) {
+                checkpoints_host.push_back(ckpt);
+            }
+        }
+
         return server_prompt {
             tokens.clone(),
-            checkpoints,
+            std::move(checkpoints_host),
         };
     }
 };

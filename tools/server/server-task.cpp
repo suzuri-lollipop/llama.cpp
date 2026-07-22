@@ -1663,9 +1663,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // on-device checkpoints reference the live per-sequence device storage and cannot be cached
+    std::list<common_prompt_checkpoint> checkpoints;
+    for (const auto & ckpt : prompt.checkpoints) {
+        if (!ckpt.on_device) {
+            checkpoints.push_back(ckpt);
+        }
+    }
+
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
+    for (const auto & ckpt : checkpoints) {
         checkpoints_size += ckpt.size();
     }
 
@@ -1723,7 +1731,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::move(checkpoints),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),

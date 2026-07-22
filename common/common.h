@@ -1099,6 +1099,11 @@ struct common_prompt_checkpoint {
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
+    // target state is kept in device memory (see LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)
+    // note: the device stores a single snapshot per sequence, so at most one such checkpoint
+    //       per sequence can be valid at a time
+    bool on_device = false;
+
     llama_pos pos_min;
     llama_pos pos_max;
 
