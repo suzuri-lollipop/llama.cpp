@@ -39,6 +39,19 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// pinned host buffer used to stage state transfers between device and host memory
+struct llama_state_staging {
+    ggml_backend_buffer_ptr buf;
+
+    uint8_t * base = nullptr;
+    size_t    size = 0;
+
+    // default buffer type of each backend, used to find the backend that owns a tensor
+    std::map<ggml_backend_buffer_type_t, ggml_backend_t> backends;
+
+    bool init = false;
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -372,6 +385,12 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+    // lazily initialized, see state_staging_get()
+    // env: LLAMA_STATE_STAGING_DISABLE
+    llama_state_staging state_staging;
+
+    llama_state_staging * state_staging_get();
 
     bool has_evaluated_once = false;
 
