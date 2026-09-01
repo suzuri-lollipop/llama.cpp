@@ -1633,6 +1633,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"-lcm", "--lookup-cache-mmap"}, "MODE",
+        "how to access the static lookup cache (default: auto)\n"
+        "- auto: memory-map the cache if it is in the indexed format, otherwise read it into RAM\n"
+        "- on:   memory-map the cache, keeping it on the storage device (SSD, persistent memory)\n"
+        "        instead of in RAM. requires a cache converted with llama-lookup-index\n"
+        "- off:  always read the whole cache into RAM",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto") { params.speculative.ngram_cache.lookup_cache_mmap = COMMON_NGRAM_CACHE_MMAP_AUTO; }
+            else if (value == "on")   { params.speculative.ngram_cache.lookup_cache_mmap = COMMON_NGRAM_CACHE_MMAP_ON;   }
+            else if (value == "off")  { params.speculative.ngram_cache.lookup_cache_mmap = COMMON_NGRAM_CACHE_MMAP_OFF;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOOKUP_CACHE_MMAP"));
+    add_opt(common_arg(
+        {"--lookup-cache-prefetch"},
+        {"--no-lookup-cache-prefetch"},
+        "whether to read a memory-mapped lookup cache ahead of time (default: disabled)\n"
+        "leave this disabled for caches on an SSD or on persistent memory, where the point of\n"
+        "mapping the file is to not pull it into RAM",
+        [](common_params & params, bool value) {
+            params.speculative.ngram_cache.lookup_cache_prefetch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOOKUP_CACHE_PREFETCH"));
+    add_opt(common_arg(
         {"-c", "--ctx-size"}, "N",
         string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
         [](common_params & params, int value) {

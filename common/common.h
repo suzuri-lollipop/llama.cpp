@@ -4,6 +4,8 @@
 
 #include "llama-cpp.h"
 
+#include "ngram-cache.h"
+
 #include "ggml-opt.h"
 #include "ggml.h"
 #include "llama.h"
@@ -365,6 +367,13 @@ struct common_params_speculative_ngram_map {
 struct common_params_speculative_ngram_cache {
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
+
+    // whether to query the static cache directly from a memory mapping of the file instead of
+    // reading it into RAM - lets a large cache live on an SSD or on persistent memory
+    enum common_ngram_cache_mmap_mode lookup_cache_mmap = COMMON_NGRAM_CACHE_MMAP_AUTO;
+
+    // hint the OS to read the mapped cache ahead of time instead of faulting it in on demand
+    bool lookup_cache_prefetch = false;
 };
 
 struct common_params_speculative {

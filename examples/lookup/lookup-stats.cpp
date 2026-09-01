@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,9 +40,9 @@ int main(int argc, char ** argv){
     std::vector<llama_token> inp;
     inp = common_tokenize(ctx, params.prompt, true, true);
 
-    common_ngram_cache ngram_cache_context;
-    common_ngram_cache ngram_cache_dynamic;
-    common_ngram_cache ngram_cache_static;
+    common_ngram_cache        ngram_cache_context;
+    common_ngram_cache        ngram_cache_dynamic;
+    common_ngram_cache_static ngram_cache_static;
 
     int64_t t_draft_flat_us = 0;
     int64_t t_draft_us = 0;
@@ -51,9 +52,12 @@ int main(int argc, char ** argv){
 
         if (!params.speculative.ngram_cache.lookup_cache_static.empty()) {
             try {
-                ngram_cache_static = common_ngram_cache_load(params.speculative.ngram_cache.lookup_cache_static);
-            } catch (std::ifstream::failure const &) {
-                LOG_ERR("failed to open static lookup cache: %s", params.speculative.ngram_cache.lookup_cache_static.c_str());
+                ngram_cache_static = common_ngram_cache_open_static(
+                        params.speculative.ngram_cache.lookup_cache_static,
+                        params.speculative.ngram_cache.lookup_cache_mmap,
+                        params.speculative.ngram_cache.lookup_cache_prefetch);
+            } catch (const std::exception & err) {
+                LOG_ERR("failed to open static lookup cache: %s (%s)", params.speculative.ngram_cache.lookup_cache_static.c_str(), err.what());
                 exit(1);
             }
         }
