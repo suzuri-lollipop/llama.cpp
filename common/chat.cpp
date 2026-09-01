@@ -6,6 +6,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "json-schema-to-grammar.h"
+#include "json.h"
 #include "log.h"
 
 #include "jinja/value.h"
@@ -13,14 +14,13 @@
 #include "jinja/caps.h"
 #include "peg-parser.h"
 
-#include "nlohmann/json.hpp"
-
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <functional>
+#include <iomanip>
 #include <map>
 
 #include <optional>
@@ -30,7 +30,7 @@
 #include <utility>
 #include <vector>
 
-using json = nlohmann::ordered_json;
+using json = common_json;
 
 static std::string format_time(const std::chrono::system_clock::time_point & now, const std::string & format) {
     auto               time       = std::chrono::system_clock::to_time_t(now);
@@ -48,7 +48,7 @@ static json safe_args_parse(const std::string & to_parse) {
     }
     try {
         return json::parse(stripped);
-    } catch (json::exception & e) {
+    } catch (const common_json_error & e) {
         return stripped;
     }
 }
@@ -470,36 +470,80 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
     return msgs;
 }
 
+struct messages_inp_normalizer {
+    const jinja::caps & caps;
+
+    messages_inp_normalizer(const jinja::caps & c) : caps(c) {}
+
+    // handle supports_string_content / supports_typed_content
+    // if string=true and array=false, convert array to string
+    // if string=false and array=true, convert string to array
+    // if both are true, do nothing
+    json normalize(const json & messages) {
+        bool only_string = caps.supports_string_content && !caps.supports_typed_content;
+        bool only_typed  = !caps.supports_string_content && caps.supports_typed_content;
+        if ((!only_string && !only_typed) || !messages.is_array()) {
+            return messages;
+        }
+        json normalized = json::array();
+        for (const auto & msg : messages) {
+            json copy = msg;
+            if (copy.contains("content")) {
+                json & it = copy.at("content");
+                if (only_typed && it.is_string()) {
+                    it = json::array({
+                        json{
+                            {"type", "text"},
+                            {"text", it.get<std::string>()},
+                        }
+                    });
+                } else if (only_string && it.is_array()) {
+                    it = concat_content_parts(it);
+                }
+            }
+            normalized.push_back(std::move(copy));
+        }
+        return normalized;
+    }
+
+    // join parts with newline, do not add newline before or after media markers
+    static std::string concat_content_parts(const json & parts) {
+        std::string text;
+        bool last_was_media_marker = false;
+        for (const auto & part : parts) {
+            std::string type = part.value("type", "");
+            bool add_new_line = true;
+            if (type == "text") {
+                add_new_line = !last_was_media_marker && !text.empty();
+                last_was_media_marker = false;
+            } else if (type == "media_marker") {
+                add_new_line = false;
+                last_was_media_marker = true;
+            } else {
+                LOG_WRN("Ignoring content part type: %s\n", type.c_str());
+                continue;
+            }
+
+            if (add_new_line) {
+                text += '\n';
+            }
+
+            text += part.value("text", "");
+        }
+        return text;
+    }
+};
+
 static json render_message_to_json(const std::vector<common_chat_msg> & msgs, const jinja::caps & c) {
     if (!c.supports_string_content && !c.supports_typed_content) {
         LOG_WRN("%s: Neither string content nor typed content is supported by the template. This is unexpected and may lead to issues.\n", __func__);
     }
 
-    bool only_string_accepted =  c.supports_string_content && !c.supports_typed_content;
-    bool only_typed_accepted  = !c.supports_string_content &&  c.supports_typed_content;
-
     json messages = json::array();
     for (const auto & msg : msgs) {
-        if (only_string_accepted) {
-            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ true);
-            messages.push_back(jmsg);
-        } else if (only_typed_accepted) {
-            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
-            if (jmsg.at("content").is_string()) {
-                jmsg["content"] = json::array({
-                    json{
-                        {"type", "text"},
-                        {"text", jmsg.at("content").get<std::string>()},
-                    }
-                });
-            }
-            messages.push_back(jmsg);
-        } else {
-            json jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
-            messages.push_back(jmsg);
-        }
+        messages.push_back(msg.to_json_oaicompat(/* concat_typed_text= */ false));
     }
-    return messages;
+    return messages_inp_normalizer(c).normalize(messages);
 }
 
 // DEPRECATED: only used in tests
@@ -564,7 +608,7 @@ std::vector<common_chat_tool> common_chat_tools_parse_oaicompat(const json & too
     return result;
 }
 
-common_chat_continuation common_chat_continuation_parse(const nlohmann::ordered_json & value) {
+common_chat_continuation common_chat_continuation_parse(const common_json & value) {
     if (value.is_boolean() && value.get<bool>()) {
         return COMMON_CHAT_CONTINUATION_AUTO;
     }
@@ -876,7 +920,7 @@ static void foreach_parameter(const json &                                      
     const auto &          props = params.at("properties");
     std::set<std::string> required;
     if (params.contains("required") && params.at("required").is_array()) {
-        params.at("required").get_to(required);
+        required = params.at("required").get<std::set<std::string>>();
     }
     for (const auto & [name, prop] : props.items()) {
         bool is_required = (required.find(name) != required.end());
@@ -892,8 +936,11 @@ static std::string common_chat_template_direct_apply_impl(
     const std::optional<json> & additional_context = std::nullopt) {
     jinja::context ctx(tmpl.source());
 
-    nlohmann::ordered_json inp = nlohmann::ordered_json{
-        {"messages", messages_override.has_value() ? *messages_override : inputs.messages},
+    // messages_override is already built for this template, do not touch its content parts
+    json inp = json{
+        {"messages", messages_override.has_value()
+            ? *messages_override
+            : messages_inp_normalizer(tmpl.original_caps()).normalize(inputs.messages)},
         {"bos_token", tmpl.bos_token()},
         {"eos_token", tmpl.eos_token()},
         {"enable_thinking", inputs.enable_thinking},
@@ -957,14 +1004,12 @@ static std::string common_chat_template_generation_prompt_impl(
     const std::optional<json> & tools_override = std::nullopt,
     const std::optional<json> & additional_context = std::nullopt) {
 
-    auto adjusted_messages = messages_override ? *messages_override : inputs.messages;
-
     autoparser::generation_params params = inputs;
     params.add_generation_prompt = false;
     params.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
-    std::string no_gen_prompt    = common_chat_template_direct_apply_impl(tmpl, params, adjusted_messages, tools_override, additional_context);
+    std::string no_gen_prompt    = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
     params.add_generation_prompt = true;
-    std::string gen_prompt       = common_chat_template_direct_apply_impl(tmpl, params, adjusted_messages, tools_override, additional_context);
+    std::string gen_prompt       = common_chat_template_direct_apply_impl(tmpl, params, messages_override, tools_override, additional_context);
 
     size_t prefix_len = 0;
     size_t min_size = std::min(no_gen_prompt.size(), gen_prompt.size());
@@ -1013,7 +1058,7 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
                 });
             } else if (msg.at("content").is_array()) {
                 auto blocks = msg.at("content");
-                content.insert(content.end(), blocks.begin(), blocks.end());
+                content.insert(blocks);
             }
         }
 
@@ -1132,6 +1177,8 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
         "</tool_call>",
     };
 
+    auto is_qwen3_coder  = !supports_reasoning;
+
     if (supports_reasoning) {
         data.thinking_start_tag = "<think>";
         // Support both </think> and <tool_call> as reasoning end sequences.
@@ -1172,13 +1219,15 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
     std::vector<std::string> tool_call_starts = { "<tool_call>" };
 
-    // Match complete <function=name> opener for Qwen3-Coder models that occasionally omit the
-    // starting <tool_call>. The model may hallucinate a tool name, but it is preferable over
-    // constraining on <function which may occur in valid content generation, e.g. #include <functional>
-    foreach_function(inputs.tools, [&](const json & tool) {
-        const std::string name = tool.at("function").at("name");
-        tool_call_starts.push_back("<function=" + name + ">");
-    });
+    if (is_qwen3_coder) {
+        // Match complete <function=name> opener for Qwen3-Coder models that occasionally omit the
+        // starting <tool_call>. The model may hallucinate a tool name, but it is preferable over
+        // constraining on <function which may occur in valid content generation, e.g. #include <functional>
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const std::string name = tool.at("function").at("name");
+            tool_call_starts.push_back("<function=" + name + ">");
+        });
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PREFIX);
@@ -1243,10 +1292,13 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
 
             auto min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
 
+            auto tool_call_body = tool_choice + "</tool_call>" + p.space();
+            auto tool_call      = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
+
             // Qwen3-Coder models may occasionally omit the <tool_call> token.
-            auto tool_call_body  = tool_choice + "</tool_call>" + p.space();
-            auto tool_call_first = p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body);
-            auto tool_call       = p.rule("tool-call", "<tool_call>\n" + tool_call_body);
+            auto tool_call_first = is_qwen3_coder ?
+                p.rule("tool-call-first", p.optional(p.literal("<tool_call>\n")) + tool_call_body) :
+                tool_call;
 
             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
@@ -2193,7 +2245,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
 
                 std::set<std::string> required;
                 if (params.contains("required")) {
-                    params.at("required").get_to(required);
+                    required = params.at("required").get<std::set<std::string>>();
                 }
 
                 auto schema_info = common_schema_info();
@@ -2815,7 +2867,7 @@ static common_chat_params common_chat_params_init_minimax_m3(const common_chat_t
 
                 std::set<std::string> required;
                 if (schema.contains("required")) {
-                    schema.at("required").get_to(required);
+                    required = schema.at("required").get<std::set<std::string>>();
                 }
 
                 std::vector<common_peg_parser> required_elements;
@@ -2927,10 +2979,10 @@ static void system_message_not_supported(json & messages) {
             auto & second_msg = messages[1];
             second_msg["content"] = first_msg.at("content").get<std::string>()
                 + "\n" + second_msg.at("content").get<std::string>();
-            messages.erase(messages.begin());
+            messages.erase(0);
         } else {
             LOG_WRN("Removing system prompt due to template not supporting system role\n");
-            messages.erase(messages.begin());
+            messages.erase(0);
         }
     }
 }
